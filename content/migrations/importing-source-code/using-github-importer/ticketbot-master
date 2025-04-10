@@ -1,0 +1,247 @@
+pip"""
+Telegram Ticket Bot v2.1
+Features:
+- Multi-team ticket system
+- Priority levels
+- Admin controls
+- JSON database
+- Interactive menus
+"""
+
+import json
+from uuid import uuid4
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater,
+    CommandHandler,
+    CallbackQueryHandler,
+    CallbackContext,
+    MessageHandler,
+    Filters
+)
+
+# ===== CONFIGURATION =====
+TOKEN = "7411619951:AAFrj2qTophn5v7oIxC4g2x60cEhmEN7Z4Y"  # Replace with your bot token
+ADMIN_IDS = [8030501124]        # Your Telegram ID
+SUPPORT_TEAMS = {
+    "tech": "🛠 Technical Support",
+    "billing": "💳 Billing Department",
+    "general": "📌 General Questions"
+}
+PRIORITY_LEVELS = {
+    "low": "🔹 Low",
+    "medium": "🔸 Medium",
+    "high": "🔺 High",
+    "critical": "🚨 Critical"
+}
+
+# ===== DATABASE FUNCTIONS =====
+def load_db():
+    try:
+        with open("tickets_db.json", "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"tickets": {}, "counters": {team: 0 for team in SUPPORT_TEAMS}}
+
+def save_db():
+    with open("tickets_db.json", "w") as f:
+        json.dump(DB, f, indent=2)
+
+DB = load_db()
+
+# ===== TICKET MANAGEMENT =====
+def generate_ticket_id(team):
+    DB["counters"][team] += 1
+    return f"{team.upper()}-{DB['counters'][team]:04d}"
+
+def create_ticket(user_id, team, priority, message):
+    ticket_id = generate_ticket_id(team)
+    DB["tickets"][ticket_id] = {
+        "user": user_id,
+        "team": team,
+        "priority": priority,
+        "status": "open",
+        "message": message,
+        "notes": [],
+        "created_at": str(datetime.now()),
+        "assigned_to": None
+    }
+    save_db()
+    return ticket_id
+
+# ===== COMMAND HANDLERS =====
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "🎟 <b>Support Ticket Bot</b>\n\n"
+        "Available commands:\n"
+        "/newticket - Create a new support ticket\n"
+        "/mytickets - List your open tickets\n"
+        "/help - Show this message\n\n"
+        "Admin commands:\n"
+        "/tickets - List all tickets\n"
+        "/close [id] - Close a ticket",
+        parse_mode="HTML"
+    )
+
+def new_ticket(update: Update, context: CallbackContext):
+    buttons = [
+        [InlineKeyboardButton(name, callback_data=f"newteam_{team}")]
+        for team, name in SUPPORT_TEAMS.items()
+    ]
+    update.message.reply_text(
+        "📝 <b>Create New Ticket</b>\n\n"
+        "First, select a support team:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode="HTML"
+    )
+
+def my_tickets(update: Update, context: CallbackContext):
+    user_tickets = [
+        f"<b>{tid}</b>: {t['team']} ({t['priority']}) - {t['status']}"
+        for tid, t in DB["tickets"].items()
+        if t["user"] == update.effective_user.id and t["status"] == "open"
+    ]
+    
+    update.message.reply_text(
+        "📋 <b>Your Open Tickets</b>\n\n" + "\n".join(user_tickets) if user_tickets else "No open tickets found.",
+        parse_mode="HTML"
+    )
+
+# ===== CALLBACK HANDLERS =====
+def button_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    data = query.data.split("_")
+    
+    if data[0] == "newteam":
+        context.user_data["new_ticket"] = {"team": data[1]}
+        buttons = [
+            [InlineKeyboardButton(name, callback_data=f"newprio_{prio}")]
+            for prio, name in PRIORITY_LEVELS.items()
+        ]
+        query.edit_message_text(
+            text=f"🛠 Team: <b>{SUPPORT_TEAMS[data[1]]}</b>\n\n"
+                 "Select priority level:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="HTML"
+        )
+    
+    elif data[0] == "newprio":
+        context.user_data["new_ticket"]["priority"] = data[1]
+        query.edit_message_text(
+            text=f"📝 <b>New Ticket</b>\n\n"
+                 f"Team: {SUPPORT_TEAMS[context.user_data['new_ticket']['team']]}\n"
+                 f"Priority: {PRIORITY_LEVELS[data[1]]}\n\n"
+                 "<b>Please describe your issue:</b>",
+            parse_mode="HTML"
+        )
+        context.user_data["awaiting_description"] = True
+
+def handle_description(update: Update, context: CallbackContext):
+    if context.user_data.get("awaiting_description"):
+        ticket_data = context.user_data["new_ticket"]
+        ticket_id = create_ticket(
+            update.effective_user.id,
+            ticket_data["team"],
+            ticket_data["priority"],
+            update.message.text
+        )
+        
+        update.message.reply_text(
+            f"✅ <b>Ticket Created!</b>\n\n"
+            f"ID: <code>{ticket_id}</code>\n"
+            f"Team: {SUPPORT_TEAMS[ticket_data['team']]}\n"
+            f"Priority: {PRIORITY_LEVELS[ticket_data['priority']]}\n\n"
+            "A support agent will contact you soon.",
+            parse_mode="HTML"
+        )
+        
+        # Notify admins
+        for admin in ADMIN_IDS:
+            context.bot.send_message(
+                admin,
+                f"🚨 <b>New Ticket</b>\n\n"
+                f"ID: <code>{ticket_id}</code>\n"
+                f"User: @{update.effective_user.username}\n"
+                f"Priority: {PRIORITY_LEVELS[ticket_data['priority']]}\n\n"
+                f"<b>Message:</b>\n{update.message.text}",
+                parse_mode="HTML"
+            )
+        
+        context.user_data.clear()
+
+# ===== ADMIN COMMANDS =====
+def list_tickets(update: Update, context: CallbackContext):
+    if update.effective_user.id not in ADMIN_IDS:
+        update.message.reply_text("❌ Admin access required")
+        return
+    
+    tickets = [
+        f"<b>{tid}</b>: {t['team']} ({t['priority']}) - {t['status']}"
+        for tid, t in DB["tickets"].items()
+        if t["status"] == "open"
+    ]
+    
+    update.message.reply_text(
+        "📋 <b>Open Tickets</b>\n\n" + "\n".join(tickets) if tickets else "No open tickets",
+        parse_mode="HTML"
+    )
+
+def close_ticket(update: Update, context: CallbackContext):
+    if update.effective_user.id not in ADMIN_IDS:
+        update.message.reply_text("❌ Admin access required")
+        return
+    
+    if not context.args:
+        update.message.reply_text("Usage: /close TICKET_ID")
+        return
+    
+    ticket_id = context.args[0].upper()
+    if ticket_id not in DB["tickets"]:
+        update.message.reply_text("❌ Ticket not found")
+        return
+    
+    DB["tickets"][ticket_id]["status"] = "closed"
+    DB["tickets"][ticket_id]["closed_at"] = str(datetime.now())
+    save_db()
+    
+    update.message.reply_text(f"✅ Ticket <code>{ticket_id}</code> closed", parse_mode="HTML")
+    
+    # Notify user
+    context.bot.send_message(
+        DB["tickets"][ticket_id]["user"],
+        f"📌 <b>Ticket Closed</b>\n\n"
+        f"Your ticket <code>{ticket_id}</code> has been resolved.\n\n"
+        f"Thank you for contacting support!",
+        parse_mode="HTML"
+    )
+
+# ===== MAIN SETUP =====
+def main():
+    updater = Updater(TOKEN)
+    dp = updater.dispatcher
+
+    # User commands
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("newticket", new_ticket))
+    dp.add_handler(CommandHandler("mytickets", my_tickets))
+    dp.add_handler(CommandHandler("help", start))
+    
+    # Admin commands
+    dp.add_handler(CommandHandler("tickets", list_tickets))
+    dp.add_handler(CommandHandler("close", close_ticket))
+    
+    # Callbacks
+    dp.add_handler(CallbackQueryHandler(button_handler))
+    
+    # Message handler
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_description))
+    
+    print("🤖 Bot is running...")
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
+    
+    
